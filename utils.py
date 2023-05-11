@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import copy
+import timm
 
 def get_transforms(dataset_name):
     if dataset_name == 'cifar10' or dataset_name == 'cifar100' or dataset_name == "places365":
@@ -69,29 +70,42 @@ def get_dataset(dataset_name, data_dir='/home/ubuntu/data',test_transform=None, 
         return test_set
 
 class ModelWithLogits(torch.nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, model_src):
         super().__init__()
-        self.original_fc = copy.deepcopy(model.fc)
-        self.feature_extraxtor = copy.deepcopy(model)
-        self.feature_extraxtor.fc = torch.nn.Identity()
+        if model_src == 'timm':
+            # is timm model
+            self.original_fc = copy.deepcopy(model.get_classifier())
+            self.feature_extraxtor = copy.deepcopy(model)
+            self.feature_extraxtor.reset_classifier(0)
+        elif model_src == 'torchvision':
+            self.original_fc = copy.deepcopy(model.fc)
+            self.feature_extraxtor = copy.deepcopy(model)
+            self.feature_extraxtor.fc = torch.nn.Identity()
+        else:
+            raise ValueError(f"unknown model src {model_src}")
 
     def forward(self, x):
         feats = self.feature_extraxtor(x)
         logits = self.original_fc(feats)
         return feats, logits
 
-def get_model(model_name):
-    if model_name == "resnet18":
-        model = models.resnet18(pretrained=True)
-    elif model_name == "resnet50":
-        model = models.resnet50(pretrained=True)
+def get_model(model_name, model_src='torchvision'):
+    if model_src == 'torchvision':
+        if model_name == "resnet18":
+            model = models.resnet18(pretrained=True)
+        elif model_name == "resnet50":
+            model = models.resnet50(pretrained=True)
+        else:
+            raise ValueError(f"unknown model name {model_name}")
+    elif model_src == 'timm':
+        model = timm.create_model(model_name, pretrained=True)
     else:
-        raise ValueError(f"unknown model name {model_name}")
-    return ModelWithLogits(model)
+        raise ValueError(f"unknown model src {model_src}")
+    return ModelWithLogits(model, model_src)
 
 
 
-def get_features(model, dataset, batch_size=32, num_workers=8):
+def get_features(model, dataset, batch_size=128, num_workers=8):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     assert isinstance(model, ModelWithLogits)
     model.to(device)
@@ -139,23 +153,24 @@ def get_logits_from_feats(feats, lin, batch_size=32, num_workers=8):
     return all_preds
 
 def get_recon_loss(recon_model, logits, features, batch_size=16):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rec_loss = torch.nn.MSELoss()
     recon_model.eval()
     test_loss = 0
     for b in range(0, len(logits), batch_size):
         with torch.no_grad():
-            x = logits[b:b+batch_size]
-            y = features[b:b+batch_size]
+            x = logits[b:b+batch_size].to(device)
+            y = features[b:b+batch_size].to(device)
             pred_y = recon_model(x)
             loss = rec_loss(pred_y, y)
             test_loss += loss.item()
     return test_loss
 
-def learn_reconstruct(logits, features, test_logits, test_features):
-    lin = torch.nn.Linear(logits.shape[1], features.shape[1])
+def learn_reconstruct(logits, features, test_logits, test_features, epochs=100, batch_size=256):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    lin = torch.nn.Linear(logits.shape[1], features.shape[1]).to(device)
     rec_loss = torch.nn.MSELoss()
-    epochs = 100
-    batch_size = 16
+    
     optimizer = torch.optim.SGD(lin.parameters(), lr = 0.1, momentum = 0.9)
     
     logits = torch.FloatTensor(logits)
@@ -167,8 +182,8 @@ def learn_reconstruct(logits, features, test_logits, test_features):
         total_loss = 0
         for b in range(0, len(logits), batch_size):
             optimizer.zero_grad()
-            x = logits[b:b+batch_size]
-            y = features[b:b+batch_size]
+            x = logits[b:b+batch_size].to(device)
+            y = features[b:b+batch_size].to(device)
             pred_y = lin(x)
             loss = rec_loss(pred_y, y)
             loss.backward()
@@ -179,7 +194,7 @@ def learn_reconstruct(logits, features, test_logits, test_features):
             print(f"Epoch {i}, train loss={total_loss}, test loss = {test_loss}")
             lin.train()
             
-    return lin
+    return lin.cpu()
 
 def do_feat_recon(logits, recon_model_):
     batch_size = 16
